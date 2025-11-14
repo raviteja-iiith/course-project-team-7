@@ -323,7 +323,7 @@ void handle_write_update(int sock, const char* filename, int word_idx, const cha
         int word_count = 0;
         split_into_words(sentences[sent_idx], words, &word_count);
         
-        // FIXED: 1-based word indexing as per examples in ass.txt
+        // 1-based word indexing as per spec
         if (word_idx < 1 || word_idx > word_count + 1) {
             sprintf(buffer, "ERROR Word index out of range");
             send(sock, buffer, strlen(buffer), 0);
@@ -331,33 +331,29 @@ void handle_write_update(int sock, const char* filename, int word_idx, const cha
             return;
         }
         
-        // Rebuild sentence with new word inserted (1-based indexing)
+        // Rebuild sentence with new word inserted at position word_idx (1-based)
         char new_sentence[MAX_SENTENCE_LENGTH] = "";
         for (int i = 0; i < word_idx - 1; i++) {
-            if (strlen(new_sentence) > 0) strcat(new_sentence, " ");
+            if (i > 0) strcat(new_sentence, " ");
             strcat(new_sentence, words[i]);
         }
-        if (strlen(new_sentence) > 0) strcat(new_sentence, " ");
+        if (word_idx > 1) strcat(new_sentence, " ");
         strcat(new_sentence, content);
         for (int i = word_idx - 1; i < word_count; i++) {
             strcat(new_sentence, " ");
             strcat(new_sentence, words[i]);
         }
         
-        // Check for sentence delimiters and handle them
-        char processed_content[MAX_SENTENCE_LENGTH];
-        strcpy(processed_content, new_sentence);
-        
-        // Rebuild full content with spaces between sentences
+        // Rebuild full content - replace the modified sentence
         char new_content[MAX_BUFFER] = "";
         for (int i = 0; i < sent_count; i++) {
+            if (i > 0) strcat(new_content, " ");
+            
             if (i == sent_idx) {
-                strcat(new_content, processed_content);
+                strcat(new_content, new_sentence);
             } else {
                 strcat(new_content, sentences[i]);
             }
-            // Add space between sentences (they already have their delimiters)
-            if (i < sent_count - 1) strcat(new_content, " ");
         }
         
         strcpy(files[idx].content, new_content);
