@@ -47,6 +47,8 @@
 #define MAX_FILES 1000
 #define MAX_SENTENCE_LENGTH 4096
 #define MAX_ACCESS_USERS 50
+#define MAX_FOLDERS 100
+#define MAX_CHECKPOINTS 20
 
 // Error codes
 #define ERR_FILE_NOT_FOUND 1
@@ -93,7 +95,20 @@ typedef struct {
     AccessInfo access_list[MAX_ACCESS_USERS];
     int access_count;
     int ss_index;
+    char folder[MAX_FILENAME];  // Folder path (empty string = root)
 } FileMetadata;
+
+typedef struct {
+    char foldername[MAX_FILENAME];
+    char owner[MAX_USERNAME];
+    time_t created;
+} FolderMetadata;
+
+typedef struct {
+    char tag[MAX_USERNAME];
+    char content[MAX_BUFFER];
+    time_t timestamp;
+} CheckpointData;
 
 typedef struct {
     char ip[32];

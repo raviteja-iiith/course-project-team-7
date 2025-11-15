@@ -12,6 +12,10 @@ FileMetadata files[MAX_FILES];
 int file_count = 0;
 pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+FolderMetadata folders[MAX_FOLDERS];
+int folder_count = 0;
+pthread_mutex_t folder_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 // Trie node for efficient file search
 typedef struct TrieNode {
     struct TrieNode* children[128];
@@ -75,6 +79,99 @@ int check_access(int file_idx, const char* username, int required_access) {
     return 0;
 }
 
+int find_folder_index(const char* foldername) {
+    for (int i = 0; i < folder_count; i++) {
+        if (strcmp(folders[i].foldername, foldername) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void handle_create_folder(int client_sock, const char* foldername, const char* username) {
+    char buffer[MAX_BUFFER];
+    
+    pthread_mutex_lock(&folder_mutex);
+    
+    if (find_folder_index(foldername) >= 0) {
+        pthread_mutex_unlock(&folder_mutex);
+        sprintf(buffer, "ERROR Folder already exists");
+        send(client_sock, buffer, strlen(buffer), 0);
+        return;
+    }
+    
+    strcpy(folders[folder_count].foldername, foldername);
+    strcpy(folders[folder_count].owner, username);
+    folders[folder_count].created = time(NULL);
+    folder_count++;
+    
+    pthread_mutex_unlock(&folder_mutex);
+    
+    sprintf(buffer, "ACK Folder created successfully!");
+    send(client_sock, buffer, strlen(buffer), 0);
+    log_message("NM", "Folder created");
+}
+
+void handle_move_file(int client_sock, const char* filename, const char* foldername, const char* username) {
+    char buffer[MAX_BUFFER];
+    
+    pthread_mutex_lock(&file_mutex);
+    int file_idx = find_file_index(filename);
+    
+    if (file_idx < 0) {
+        pthread_mutex_unlock(&file_mutex);
+        sprintf(buffer, "ERROR File not found");
+        send(client_sock, buffer, strlen(buffer), 0);
+        return;
+    }
+    
+    if (strcmp(files[file_idx].owner, username) != 0) {
+        pthread_mutex_unlock(&file_mutex);
+        sprintf(buffer, "ERROR Permission denied - not owner");
+        send(client_sock, buffer, strlen(buffer), 0);
+        return;
+    }
+    
+    pthread_mutex_lock(&folder_mutex);
+    if (find_folder_index(foldername) < 0) {
+        pthread_mutex_unlock(&folder_mutex);
+        pthread_mutex_unlock(&file_mutex);
+        sprintf(buffer, "ERROR Folder not found");
+        send(client_sock, buffer, strlen(buffer), 0);
+        return;
+    }
+    pthread_mutex_unlock(&folder_mutex);
+    
+    strcpy(files[file_idx].folder, foldername);
+    pthread_mutex_unlock(&file_mutex);
+    
+    sprintf(buffer, "ACK File moved successfully!");
+    send(client_sock, buffer, strlen(buffer), 0);
+    log_message("NM", "File moved");
+}
+
+void handle_view_folder(int client_sock, const char* foldername) {
+    char buffer[MAX_BUFFER] = {0};
+    
+    pthread_mutex_lock(&file_mutex);
+    int found = 0;
+    for (int i = 0; i < file_count; i++) {
+        if (strcmp(files[i].folder, foldername) == 0) {
+            strcat(buffer, "--> ");
+            strcat(buffer, files[i].filename);
+            strcat(buffer, "\n");
+            found = 1;
+        }
+    }
+    pthread_mutex_unlock(&file_mutex);
+    
+    if (!found) {
+        strcpy(buffer, "(empty folder)\n");
+    }
+    
+    send(client_sock, buffer, strlen(buffer), 0);
+}
+
 void update_file_metadata(int file_idx, const char* content) {
     files[file_idx].char_count = strlen(content);
     
@@ -128,6 +225,7 @@ void handle_register_ss(int client_sock, const char* received_buffer) {
         files[file_idx].access_count = 0;
         files[file_idx].word_count = 0;
         files[file_idx].char_count = 0;
+        files[file_idx].folder[0] = '\0';  // Root folder
         
         trie_insert(files[file_idx].filename, file_idx);
         file_count++;
@@ -296,6 +394,7 @@ void handle_create_file(int client_sock, const char* filename, const char* usern
     files[file_idx].word_count = 0;
     files[file_idx].char_count = 0;
     files[file_idx].access_count = 0;
+    files[file_idx].folder[0] = '\0';  // Root folder
     
     trie_insert(filename, file_idx);
     file_count++;
@@ -753,6 +852,15 @@ void* client_handler(void* arg) {
     } else if (strcmp(command, "EXEC") == 0) {
         sscanf(buffer, "%s %s %s", command, username, param1);
         handle_exec_file(client_sock, param1, username);
+    } else if (strcmp(command, "CREATEFOLDER") == 0) {
+        sscanf(buffer, "%s %s %s", command, username, param1);
+        handle_create_folder(client_sock, param1, username);
+    } else if (strcmp(command, "MOVE") == 0) {
+        sscanf(buffer, "%s %s %s %s", command, username, param1, param2);
+        handle_move_file(client_sock, param1, param2, username);
+    } else if (strcmp(command, "VIEWFOLDER") == 0) {
+        sscanf(buffer, "%s %s %s", command, username, param1);
+        handle_view_folder(client_sock, param1);
     }
     
     close(client_sock);

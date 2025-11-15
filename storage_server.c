@@ -10,6 +10,8 @@ typedef struct {
     int locked_sentence;
     char lock_holder[MAX_USERNAME];
     int has_backup;
+    CheckpointData checkpoints[MAX_CHECKPOINTS];
+    int checkpoint_count;
 } FileData;
 
 FileData files[MAX_FILES];
@@ -123,6 +125,7 @@ void handle_create(int sock, const char* filename) {
     files[file_count].content[0] = '\0';
     files[file_count].locked_sentence = -1;
     files[file_count].has_backup = 0;
+    files[file_count].checkpoint_count = 0;
     file_count++;
     
     pthread_mutex_unlock(&file_mutex);
@@ -442,6 +445,144 @@ void handle_getfile(int sock, const char* filename) {
     send(sock, buffer, strlen(buffer), 0);
 }
 
+void handle_checkpoint(int sock, const char* filename, const char* tag) {
+    char buffer[MAX_BUFFER];
+    
+    pthread_mutex_lock(&file_mutex);
+    
+    int idx = find_file(filename);
+    if (idx < 0) {
+        sprintf(buffer, "ERROR File not found");
+        send(sock, buffer, strlen(buffer), 0);
+        pthread_mutex_unlock(&file_mutex);
+        return;
+    }
+    
+    if (files[idx].checkpoint_count >= MAX_CHECKPOINTS) {
+        sprintf(buffer, "ERROR Maximum checkpoints reached");
+        send(sock, buffer, strlen(buffer), 0);
+        pthread_mutex_unlock(&file_mutex);
+        return;
+    }
+    
+    load_file_from_disk(filename, files[idx].content);
+    
+    int cp_idx = files[idx].checkpoint_count;
+    strcpy(files[idx].checkpoints[cp_idx].tag, tag);
+    strcpy(files[idx].checkpoints[cp_idx].content, files[idx].content);
+    files[idx].checkpoints[cp_idx].timestamp = time(NULL);
+    files[idx].checkpoint_count++;
+    
+    pthread_mutex_unlock(&file_mutex);
+    
+    sprintf(buffer, "ACK Checkpoint created successfully!");
+    send(sock, buffer, strlen(buffer), 0);
+    log_message("SS", "Checkpoint created");
+}
+
+void handle_viewcheckpoint(int sock, const char* filename, const char* tag) {
+    char buffer[MAX_BUFFER];
+    
+    pthread_mutex_lock(&file_mutex);
+    
+    int idx = find_file(filename);
+    if (idx < 0) {
+        sprintf(buffer, "ERROR File not found");
+        send(sock, buffer, strlen(buffer), 0);
+        pthread_mutex_unlock(&file_mutex);
+        return;
+    }
+    
+    int found = -1;
+    for (int i = 0; i < files[idx].checkpoint_count; i++) {
+        if (strcmp(files[idx].checkpoints[i].tag, tag) == 0) {
+            found = i;
+            break;
+        }
+    }
+    
+    if (found < 0) {
+        sprintf(buffer, "ERROR Checkpoint not found");
+        send(sock, buffer, strlen(buffer), 0);
+        pthread_mutex_unlock(&file_mutex);
+        return;
+    }
+    
+    strcpy(buffer, files[idx].checkpoints[found].content);
+    pthread_mutex_unlock(&file_mutex);
+    
+    send(sock, buffer, strlen(buffer), 0);
+}
+
+void handle_revert(int sock, const char* filename, const char* tag) {
+    char buffer[MAX_BUFFER];
+    
+    pthread_mutex_lock(&file_mutex);
+    
+    int idx = find_file(filename);
+    if (idx < 0) {
+        sprintf(buffer, "ERROR File not found");
+        send(sock, buffer, strlen(buffer), 0);
+        pthread_mutex_unlock(&file_mutex);
+        return;
+    }
+    
+    int found = -1;
+    for (int i = 0; i < files[idx].checkpoint_count; i++) {
+        if (strcmp(files[idx].checkpoints[i].tag, tag) == 0) {
+            found = i;
+            break;
+        }
+    }
+    
+    if (found < 0) {
+        sprintf(buffer, "ERROR Checkpoint not found");
+        send(sock, buffer, strlen(buffer), 0);
+        pthread_mutex_unlock(&file_mutex);
+        return;
+    }
+    
+    strcpy(files[idx].content, files[idx].checkpoints[found].content);
+    save_file_to_disk(filename, files[idx].content);
+    
+    pthread_mutex_unlock(&file_mutex);
+    
+    sprintf(buffer, "ACK Reverted to checkpoint successfully!");
+    send(sock, buffer, strlen(buffer), 0);
+    log_message("SS", "Checkpoint reverted");
+}
+
+void handle_listcheckpoints(int sock, const char* filename) {
+    char buffer[MAX_BUFFER] = {0};
+    
+    pthread_mutex_lock(&file_mutex);
+    
+    int idx = find_file(filename);
+    if (idx < 0) {
+        sprintf(buffer, "ERROR File not found");
+        send(sock, buffer, strlen(buffer), 0);
+        pthread_mutex_unlock(&file_mutex);
+        return;
+    }
+    
+    if (files[idx].checkpoint_count == 0) {
+        strcpy(buffer, "(no checkpoints)\n");
+    } else {
+        for (int i = 0; i < files[idx].checkpoint_count; i++) {
+            char line[256];
+            char time_str[64];
+            struct tm* t = localtime(&files[idx].checkpoints[i].timestamp);
+            strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M", t);
+            sprintf(line, "--> %s (%s)\n", files[idx].checkpoints[i].tag, time_str);
+            strcat(buffer, line);
+        }
+    }
+    
+    pthread_mutex_unlock(&file_mutex);
+    
+    send(sock, buffer, strlen(buffer), 0);
+}
+
 void* nm_handler(void* arg) {
     int sock = *(int*)arg;
     free(arg);
@@ -540,6 +681,25 @@ void* client_handler(void* arg) {
         } else if (strcmp(command, "UNDO") == 0) {
             sscanf(buffer, "%s %s", command, filename);
             handle_undo(sock, filename);
+            break;  // Single command, close connection
+        } else if (strcmp(command, "CHECKPOINT") == 0) {
+            char tag[MAX_USERNAME];
+            sscanf(buffer, "%s %s %s", command, filename, tag);
+            handle_checkpoint(sock, filename, tag);
+            break;  // Single command, close connection
+        } else if (strcmp(command, "VIEWCHECKPOINT") == 0) {
+            char tag[MAX_USERNAME];
+            sscanf(buffer, "%s %s %s", command, filename, tag);
+            handle_viewcheckpoint(sock, filename, tag);
+            break;  // Single command, close connection
+        } else if (strcmp(command, "REVERT") == 0) {
+            char tag[MAX_USERNAME];
+            sscanf(buffer, "%s %s %s", command, filename, tag);
+            handle_revert(sock, filename, tag);
+            break;  // Single command, close connection
+        } else if (strcmp(command, "LISTCHECKPOINTS") == 0) {
+            sscanf(buffer, "%s %s", command, filename);
+            handle_listcheckpoints(sock, filename);
             break;  // Single command, close connection
         } else {
             break;  // Unknown command, close connection

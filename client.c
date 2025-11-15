@@ -382,6 +382,218 @@ void cmd_exec(char* filename) {
     close(sock);
 }
 
+void cmd_createfolder(char* foldername) {
+    int sock = connect_to_nm();
+    if (sock < 0) return;
+    
+    char buffer[MAX_BUFFER];
+    sprintf(buffer, "CREATEFOLDER %s %s", username, foldername);
+    send(sock, buffer, strlen(buffer), 0);
+    
+    int bytes = recv(sock, buffer, MAX_BUFFER, 0);
+    buffer[bytes] = '\0';
+    
+    if (strncmp(buffer, "ERROR", 5) == 0) {
+        printf("%s\n", buffer + 6);
+    } else {
+        printf("%s\n", buffer + 4);
+    }
+    
+    close(sock);
+}
+
+void cmd_move(char* filename, char* foldername) {
+    int sock = connect_to_nm();
+    if (sock < 0) return;
+    
+    char buffer[MAX_BUFFER];
+    sprintf(buffer, "MOVE %s %s %s", username, filename, foldername);
+    send(sock, buffer, strlen(buffer), 0);
+    
+    int bytes = recv(sock, buffer, MAX_BUFFER, 0);
+    buffer[bytes] = '\0';
+    
+    if (strncmp(buffer, "ERROR", 5) == 0) {
+        printf("%s\n", buffer + 6);
+    } else {
+        printf("%s\n", buffer + 4);
+    }
+    
+    close(sock);
+}
+
+void cmd_viewfolder(char* foldername) {
+    int sock = connect_to_nm();
+    if (sock < 0) return;
+    
+    char buffer[MAX_BUFFER];
+    sprintf(buffer, "VIEWFOLDER %s %s", username, foldername);
+    send(sock, buffer, strlen(buffer), 0);
+    
+    int bytes = recv(sock, buffer, MAX_BUFFER, 0);
+    buffer[bytes] = '\0';
+    
+    printf("%s", buffer);
+    
+    close(sock);
+}
+
+void cmd_checkpoint(char* filename, char* tag) {
+    int sock = connect_to_nm();
+    if (sock < 0) return;
+    
+    char buffer[MAX_BUFFER];
+    sprintf(buffer, "WRITE %s %s", username, filename);
+    send(sock, buffer, strlen(buffer), 0);
+    
+    int bytes = recv(sock, buffer, MAX_BUFFER, 0);
+    buffer[bytes] = '\0';
+    
+    if (strncmp(buffer, "ERROR", 5) == 0) {
+        printf("%s\n", buffer + 6);
+        close(sock);
+        return;
+    }
+    
+    char ss_ip[32];
+    int ss_port;
+    sscanf(buffer, "SS_INFO %s %d", ss_ip, &ss_port);
+    close(sock);
+    
+    int ss_sock = connect_to_ss(ss_ip, ss_port);
+    if (ss_sock < 0) return;
+    
+    sprintf(buffer, "CHECKPOINT %s %s", filename, tag);
+    send(ss_sock, buffer, strlen(buffer), 0);
+    
+    bytes = recv(ss_sock, buffer, MAX_BUFFER, 0);
+    buffer[bytes] = '\0';
+    
+    if (strncmp(buffer, "ERROR", 5) == 0) {
+        printf("%s\n", buffer + 6);
+    } else {
+        printf("%s\n", buffer + 4);
+    }
+    
+    close(ss_sock);
+}
+
+void cmd_viewcheckpoint(char* filename, char* tag) {
+    int sock = connect_to_nm();
+    if (sock < 0) return;
+    
+    char buffer[MAX_BUFFER];
+    sprintf(buffer, "READ %s %s", username, filename);
+    send(sock, buffer, strlen(buffer), 0);
+    
+    int bytes = recv(sock, buffer, MAX_BUFFER, 0);
+    buffer[bytes] = '\0';
+    
+    if (strncmp(buffer, "ERROR", 5) == 0) {
+        printf("%s\n", buffer + 6);
+        close(sock);
+        return;
+    }
+    
+    char ss_ip[32];
+    int ss_port;
+    sscanf(buffer, "SS_INFO %s %d", ss_ip, &ss_port);
+    close(sock);
+    
+    int ss_sock = connect_to_ss(ss_ip, ss_port);
+    if (ss_sock < 0) return;
+    
+    sprintf(buffer, "VIEWCHECKPOINT %s %s", filename, tag);
+    send(ss_sock, buffer, strlen(buffer), 0);
+    
+    bytes = recv(ss_sock, buffer, MAX_BUFFER, 0);
+    buffer[bytes] = '\0';
+    
+    if (strncmp(buffer, "ERROR", 5) == 0) {
+        printf("%s\n", buffer + 6);
+    } else {
+        printf("%s\n", buffer);
+    }
+    
+    close(ss_sock);
+}
+
+void cmd_revert(char* filename, char* tag) {
+    int sock = connect_to_nm();
+    if (sock < 0) return;
+    
+    char buffer[MAX_BUFFER];
+    sprintf(buffer, "WRITE %s %s", username, filename);
+    send(sock, buffer, strlen(buffer), 0);
+    
+    int bytes = recv(sock, buffer, MAX_BUFFER, 0);
+    buffer[bytes] = '\0';
+    
+    if (strncmp(buffer, "ERROR", 5) == 0) {
+        printf("%s\n", buffer + 6);
+        close(sock);
+        return;
+    }
+    
+    char ss_ip[32];
+    int ss_port;
+    sscanf(buffer, "SS_INFO %s %d", ss_ip, &ss_port);
+    close(sock);
+    
+    int ss_sock = connect_to_ss(ss_ip, ss_port);
+    if (ss_sock < 0) return;
+    
+    sprintf(buffer, "REVERT %s %s", filename, tag);
+    send(ss_sock, buffer, strlen(buffer), 0);
+    
+    bytes = recv(ss_sock, buffer, MAX_BUFFER, 0);
+    buffer[bytes] = '\0';
+    
+    if (strncmp(buffer, "ERROR", 5) == 0) {
+        printf("%s\n", buffer + 6);
+    } else {
+        printf("%s\n", buffer + 4);
+    }
+    
+    close(ss_sock);
+}
+
+void cmd_listcheckpoints(char* filename) {
+    int sock = connect_to_nm();
+    if (sock < 0) return;
+    
+    char buffer[MAX_BUFFER];
+    sprintf(buffer, "READ %s %s", username, filename);
+    send(sock, buffer, strlen(buffer), 0);
+    
+    int bytes = recv(sock, buffer, MAX_BUFFER, 0);
+    buffer[bytes] = '\0';
+    
+    if (strncmp(buffer, "ERROR", 5) == 0) {
+        printf("%s\n", buffer + 6);
+        close(sock);
+        return;
+    }
+    
+    char ss_ip[32];
+    int ss_port;
+    sscanf(buffer, "SS_INFO %s %d", ss_ip, &ss_port);
+    close(sock);
+    
+    int ss_sock = connect_to_ss(ss_ip, ss_port);
+    if (ss_sock < 0) return;
+    
+    sprintf(buffer, "LISTCHECKPOINTS %s", filename);
+    send(ss_sock, buffer, strlen(buffer), 0);
+    
+    bytes = recv(ss_sock, buffer, MAX_BUFFER, 0);
+    buffer[bytes] = '\0';
+    
+    printf("%s", buffer);
+    
+    close(ss_sock);
+}
+
 void cmd_undo(char* filename) {
     int sock = connect_to_nm();
     if (sock < 0) return;
@@ -465,6 +677,27 @@ void process_command(char* line) {
     } else if (strcmp(command, "UNDO") == 0) {
         sscanf(line, "%s %s", command, arg1);
         cmd_undo(arg1);
+    } else if (strcmp(command, "CREATEFOLDER") == 0) {
+        sscanf(line, "%s %s", command, arg1);
+        cmd_createfolder(arg1);
+    } else if (strcmp(command, "MOVE") == 0) {
+        sscanf(line, "%s %s %s", command, arg1, arg2);
+        cmd_move(arg1, arg2);
+    } else if (strcmp(command, "VIEWFOLDER") == 0) {
+        sscanf(line, "%s %s", command, arg1);
+        cmd_viewfolder(arg1);
+    } else if (strcmp(command, "CHECKPOINT") == 0) {
+        sscanf(line, "%s %s %s", command, arg1, arg2);
+        cmd_checkpoint(arg1, arg2);
+    } else if (strcmp(command, "VIEWCHECKPOINT") == 0) {
+        sscanf(line, "%s %s %s", command, arg1, arg2);
+        cmd_viewcheckpoint(arg1, arg2);
+    } else if (strcmp(command, "REVERT") == 0) {
+        sscanf(line, "%s %s %s", command, arg1, arg2);
+        cmd_revert(arg1, arg2);
+    } else if (strcmp(command, "LISTCHECKPOINTS") == 0) {
+        sscanf(line, "%s %s", command, arg1);
+        cmd_listcheckpoints(arg1);
     } else if (strcmp(command, "EXIT") == 0 || strcmp(command, "QUIT") == 0) {
         exit(0);
     } else {
