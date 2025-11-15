@@ -350,12 +350,14 @@ void handle_write_update(int sock, const char* filename, int word_idx, const cha
         // Rebuild full content - replace the modified sentence
         char new_content[MAX_BUFFER] = "";
         for (int i = 0; i < sent_count; i++) {
-            if (i > 0) strcat(new_content, " ");
-            
             if (i == sent_idx) {
                 strcat(new_content, new_sentence);
             } else {
                 strcat(new_content, sentences[i]);
+            }
+            // Add space after each sentence (they already have their delimiters)
+            if (i < sent_count - 1) {
+                strcat(new_content, " ");
             }
         }
         

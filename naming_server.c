@@ -24,6 +24,18 @@ typedef struct TrieNode {
 
 TrieNode* trie_root = NULL;
 
+// LRU Cache for recent file searches
+#define CACHE_SIZE 50
+typedef struct {
+    char filename[MAX_FILENAME];
+    int file_index;
+    time_t timestamp;
+} CacheEntry;
+
+CacheEntry search_cache[CACHE_SIZE];
+int cache_count = 0;
+pthread_mutex_t cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 TrieNode* create_trie_node() {
     TrieNode* node = (TrieNode*)malloc(sizeof(TrieNode));
     node->file_index = -1;
@@ -61,8 +73,41 @@ int trie_search(const char* filename) {
 }
 
 int find_file_index(const char* filename) {
+    // Check cache first
+    pthread_mutex_lock(&cache_mutex);
+    for (int i = 0; i < cache_count; i++) {
+        if (strcmp(search_cache[i].filename, filename) == 0) {
+            search_cache[i].timestamp = time(NULL);  // Update LRU timestamp
+            int result = search_cache[i].file_index;
+            pthread_mutex_unlock(&cache_mutex);
+            return result;
+        }
+    }
+    pthread_mutex_unlock(&cache_mutex);
+    
+    // Not in cache, search using Trie
     int idx = trie_search(filename);
     if (idx >= 0 && idx < file_count && strcmp(files[idx].filename, filename) == 0) {
+        // Add to cache
+        pthread_mutex_lock(&cache_mutex);
+        if (cache_count < CACHE_SIZE) {
+            strcpy(search_cache[cache_count].filename, filename);
+            search_cache[cache_count].file_index = idx;
+            search_cache[cache_count].timestamp = time(NULL);
+            cache_count++;
+        } else {
+            // Evict oldest entry (LRU)
+            int oldest = 0;
+            for (int i = 1; i < CACHE_SIZE; i++) {
+                if (search_cache[i].timestamp < search_cache[oldest].timestamp) {
+                    oldest = i;
+                }
+            }
+            strcpy(search_cache[oldest].filename, filename);
+            search_cache[oldest].file_index = idx;
+            search_cache[oldest].timestamp = time(NULL);
+        }
+        pthread_mutex_unlock(&cache_mutex);
         return idx;
     }
     return -1;
@@ -77,6 +122,53 @@ int check_access(int file_idx, const char* username, int required_access) {
         }
     }
     return 0;
+}
+
+void save_metadata() {
+    FILE* f = fopen("nm_metadata.dat", "wb");
+    if (!f) return;
+    
+    // Save file metadata
+    fwrite(&file_count, sizeof(int), 1, f);
+    for (int i = 0; i < file_count; i++) {
+        fwrite(&files[i], sizeof(FileMetadata), 1, f);
+    }
+    
+    // Save folder metadata
+    fwrite(&folder_count, sizeof(int), 1, f);
+    for (int i = 0; i < folder_count; i++) {
+        fwrite(&folders[i], sizeof(FolderMetadata), 1, f);
+    }
+    
+    fclose(f);
+    log_message("NM", "Metadata saved to disk");
+}
+
+void load_metadata() {
+    FILE* f = fopen("nm_metadata.dat", "rb");
+    if (!f) {
+        log_message("NM", "No metadata file found, starting fresh");
+        return;
+    }
+    
+    // Load file metadata
+    fread(&file_count, sizeof(int), 1, f);
+    for (int i = 0; i < file_count; i++) {
+        fread(&files[i], sizeof(FileMetadata), 1, f);
+        trie_insert(files[i].filename, i);  // Rebuild trie
+    }
+    
+    // Load folder metadata
+    fread(&folder_count, sizeof(int), 1, f);
+    for (int i = 0; i < folder_count; i++) {
+        fread(&folders[i], sizeof(FolderMetadata), 1, f);
+    }
+    
+    fclose(f);
+    
+    char log_msg[256];
+    sprintf(log_msg, "Metadata loaded: %d files, %d folders", file_count, folder_count);
+    log_message("NM", log_msg);
 }
 
 int find_folder_index(const char* foldername) {
@@ -106,6 +198,8 @@ void handle_create_folder(int client_sock, const char* foldername, const char* u
     folder_count++;
     
     pthread_mutex_unlock(&folder_mutex);
+    
+    save_metadata();  // Save after creating folder
     
     sprintf(buffer, "ACK Folder created successfully!");
     send(client_sock, buffer, strlen(buffer), 0);
@@ -279,10 +373,7 @@ void handle_register_client(int client_sock, const char* received_buffer) {
         clients[existing_client].port = port;
         clients[existing_client].active = 1;
         sprintf(buffer, "ACK Client reconnected: %s", username);
-        
-        char log_msg[256];
-        sprintf(log_msg, "Client reconnected: %s", username);
-        log_message("NM", log_msg);
+        log_detailed("NM", "Client reconnected", username, ip, port);
     } else {
         // Register new client
         int client_idx = client_count;
@@ -293,10 +384,7 @@ void handle_register_client(int client_sock, const char* received_buffer) {
         client_count++;
         
         sprintf(buffer, "ACK Client registered: %s", username);
-        
-        char log_msg[256];
-        sprintf(log_msg, "Client registered: %s", username);
-        log_message("NM", log_msg);
+        log_detailed("NM", "Client registered", username, ip, port);
     }
     
     pthread_mutex_unlock(&client_mutex);
@@ -400,6 +488,8 @@ void handle_create_file(int client_sock, const char* filename, const char* usern
     file_count++;
     pthread_mutex_unlock(&file_mutex);
     
+    save_metadata();  // Save after creating file
+    
     // Try to send create command to SS (optional - file creation works without it)
     if (ss_count > 0) {
         printf("DEBUG: Attempting to send CREATE to SS at %s:%d\n", 
@@ -442,7 +532,7 @@ void handle_create_file(int client_sock, const char* filename, const char* usern
     sprintf(buffer, "ACK File Created Successfully!");
     send(client_sock, buffer, strlen(buffer), 0);
     
-    log_message("NM", "File created");
+    log_detailed("NM", "File created", username, NULL, 0);
 }
 
 void handle_delete_file(int client_sock, const char* filename, const char* username) {
@@ -495,10 +585,12 @@ void handle_delete_file(int client_sock, const char* filename, const char* usern
     
     pthread_mutex_unlock(&file_mutex);
     
+    save_metadata();  // Save after deleting file
+    
     sprintf(buffer, "ACK File '%s' deleted successfully!", filename);
     send(client_sock, buffer, strlen(buffer), 0);
     
-    log_message("NM", "File deleted");
+    log_detailed("NM", "File deleted", username, NULL, 0);
 }
 
 void handle_info_file(int client_sock, const char* filename, const char* username) {
@@ -904,6 +996,9 @@ int main(int argc, char* argv[]) {
     
     printf("Naming Server started on port %d\n", port);
     log_message("NM", "Naming Server started");
+    
+    // Load metadata from disk
+    load_metadata();
     
     while (1) {
         struct sockaddr_in client_addr;

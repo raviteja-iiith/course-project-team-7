@@ -126,6 +126,7 @@ typedef struct {
 } ClientInfo;
 
 void log_message(const char* component, const char* message);
+void log_detailed(const char* component, const char* message, const char* username, const char* ip, int port);
 void get_timestamp(char* buffer, size_t size);
 
 #endif
