@@ -1,5 +1,6 @@
 #include "common.h"
 #include <signal.h>
+#include <sys/time.h>
 
 char username[MAX_USERNAME];
 char nm_ip[32];
@@ -33,8 +34,16 @@ int connect_to_ss(const char* ip, int port) {
     addr.sin_port = htons(port);
     inet_pton(AF_INET, ip, &addr.sin_addr);
     
+    // Set connection timeout
+    struct timeval timeout;
+    timeout.tv_sec = 3;
+    timeout.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    
     if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("Cannot connect to storage server");
+        printf("ERROR: Storage server is not available. Please ensure storage server is running.\n");
+        close(sock);
         return -1;
     }
     
@@ -125,12 +134,20 @@ void cmd_read(char* filename) {
     
     // Connect to SS
     int ss_sock = connect_to_ss(ss_ip, ss_port);
-    if (ss_sock < 0) return;
+    if (ss_sock < 0) {
+        printf("ERROR: Cannot connect to storage server. File may be on a server that is currently down.\n");
+        return;
+    }
     
     sprintf(buffer, "read %s", filename);
     send(ss_sock, buffer, strlen(buffer), 0);
     
     bytes = recv(ss_sock, buffer, MAX_BUFFER, 0);
+    if (bytes <= 0) {
+        printf("ERROR: Storage server disconnected or not responding.\n");
+        close(ss_sock);
+        return;
+    }
     buffer[bytes] = '\0';
     
     if (strncmp(buffer, "ERROR", 5) == 0) {
@@ -179,13 +196,21 @@ void cmd_write(char* filename, int sentence_idx) {
     
     // Connect to SS
     int ss_sock = connect_to_ss(ss_ip, ss_port);
-    if (ss_sock < 0) return;
+    if (ss_sock < 0) {
+        printf("ERROR: Cannot connect to storage server. File may be on a server that is currently down.\n");
+        return;
+    }
     
     // Start write
     sprintf(buffer, "WRITE_START %s %d", filename, sentence_idx);
     send(ss_sock, buffer, strlen(buffer), 0);
     
     bytes = recv(ss_sock, buffer, MAX_BUFFER, 0);
+    if (bytes <= 0) {
+        printf("ERROR: Storage server disconnected or not responding.\n");
+        close(ss_sock);
+        return;
+    }
     buffer[bytes] = '\0';
     
     if (strncmp(buffer, "ERROR", 5) == 0) {
@@ -282,7 +307,10 @@ void cmd_stream(char* filename) {
     
     // Connect to SS
     int ss_sock = connect_to_ss(ss_ip, ss_port);
-    if (ss_sock < 0) return;
+    if (ss_sock < 0) {
+        printf("ERROR: Cannot connect to storage server. File may be on a server that is currently down.\n");
+        return;
+    }
     
     sprintf(buffer, "STREAM %s", filename);
     send(ss_sock, buffer, strlen(buffer), 0);
@@ -290,7 +318,10 @@ void cmd_stream(char* filename) {
     // Receive streaming content
     while (1) {
         bytes = recv(ss_sock, buffer, MAX_BUFFER, 0);
-        if (bytes <= 0) break;
+        if (bytes <= 0) {
+            printf("\nERROR: Storage server disconnected.\n");
+            break;
+        }
         
         buffer[bytes] = '\0';
         
@@ -618,12 +649,20 @@ void cmd_undo(char* filename) {
     
     // Connect to SS
     int ss_sock = connect_to_ss(ss_ip, ss_port);
-    if (ss_sock < 0) return;
+    if (ss_sock < 0) {
+        printf("ERROR: Cannot connect to storage server. File may be on a server that is currently down.\n");
+        return;
+    }
     
     sprintf(buffer, "UNDO %s", filename);
     send(ss_sock, buffer, strlen(buffer), 0);
     
     bytes = recv(ss_sock, buffer, MAX_BUFFER, 0);
+    if (bytes <= 0) {
+        printf("ERROR: Storage server disconnected or not responding.\n");
+        close(ss_sock);
+        return;
+    }
     buffer[bytes] = '\0';
     
     if (strncmp(buffer, "ERROR", 5) == 0) {

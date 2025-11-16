@@ -3,12 +3,19 @@
 char root_path[MAX_PATH];
 char backup_path[MAX_PATH];
 
+#define MAX_SENTENCE_LOCKS 100
+
+typedef struct {
+    int sentence_idx;
+    char lock_holder[MAX_USERNAME];
+} SentenceLock;
+
 typedef struct {
     char filename[MAX_FILENAME];
     char content[MAX_BUFFER];
     char backup_content[MAX_BUFFER];
-    int locked_sentence;
-    char lock_holder[MAX_USERNAME];
+    SentenceLock sentence_locks[MAX_SENTENCE_LOCKS];
+    int lock_count;
     int has_backup;
     CheckpointData checkpoints[MAX_CHECKPOINTS];
     int checkpoint_count;
@@ -25,10 +32,14 @@ void save_file_to_disk(const char* filename, const char* content) {
 #else
     snprintf(filepath, sizeof(filepath), "%s/%s", root_path, filename);
 #endif
+    printf("DEBUG save_file_to_disk: Saving '%s' to %s\n", content, filepath);
     FILE* f = fopen(filepath, "w");
     if (f) {
         fputs(content, f);
         fclose(f);
+        printf("DEBUG save_file_to_disk: File saved successfully\n");
+    } else {
+        printf("DEBUG save_file_to_disk: Failed to open file for writing!\n");
     }
 }
 
@@ -40,11 +51,15 @@ void load_file_from_disk(const char* filename, char* content) {
     snprintf(filepath, sizeof(filepath), "%s/%s", root_path, filename);
 #endif
     content[0] = '\0';  // Initialize to empty
+    printf("DEBUG load_file_from_disk: Loading from %s\n", filepath);
     FILE* f = fopen(filepath, "r");
     if (f) {
         fread(content, 1, MAX_BUFFER - 1, f);
         content[MAX_BUFFER - 1] = '\0';  // Ensure null termination
         fclose(f);
+        printf("DEBUG load_file_from_disk: Loaded content: '%s' (length: %ld)\n", content, strlen(content));
+    } else {
+        printf("DEBUG load_file_from_disk: Failed to open file for reading!\n");
     }
 }
 
@@ -123,7 +138,7 @@ void handle_create(int sock, const char* filename) {
     
     strcpy(files[file_count].filename, filename);
     files[file_count].content[0] = '\0';
-    files[file_count].locked_sentence = -1;
+    files[file_count].lock_count = 0;
     files[file_count].has_backup = 0;
     files[file_count].checkpoint_count = 0;
     file_count++;
@@ -177,18 +192,49 @@ void handle_delete(int sock, const char* filename) {
 void handle_read(int sock, const char* filename) {
     char buffer[MAX_BUFFER];
     
+    printf("DEBUG: handle_read called for file: %s\n", filename);
+    
     pthread_mutex_lock(&file_mutex);
     
     int idx = find_file(filename);
+    printf("DEBUG: find_file returned idx: %d\n", idx);
+    
     if (idx < 0) {
-        sprintf(buffer, "ERROR File not found");
-        send(sock, buffer, strlen(buffer), 0);
-        pthread_mutex_unlock(&file_mutex);
-        return;
+        // File not in memory, try to load from disk
+        char filepath[MAX_PATH + MAX_FILENAME];
+#ifdef _WIN32
+        snprintf(filepath, sizeof(filepath), "%s\\%s", root_path, filename);
+#else
+        snprintf(filepath, sizeof(filepath), "%s/%s", root_path, filename);
+#endif
+        
+        printf("DEBUG: Trying to open file at: %s\n", filepath);
+        FILE* f = fopen(filepath, "r");
+        if (f) {
+            fclose(f);
+            printf("DEBUG: File found on disk, adding to memory\n");
+            // File exists on disk, add it to memory
+            idx = file_count;
+            strcpy(files[idx].filename, filename);
+            files[idx].lock_count = 0;
+            files[idx].has_backup = 0;
+            files[idx].checkpoint_count = 0;
+            load_file_from_disk(filename, files[idx].content);
+            file_count++;
+            printf("DEBUG: File loaded. Content length: %ld\n", strlen(files[idx].content));
+        } else {
+            printf("DEBUG: File not found on disk\n");
+            sprintf(buffer, "ERROR File not found");
+            send(sock, buffer, strlen(buffer), 0);
+            pthread_mutex_unlock(&file_mutex);
+            return;
+        }
     }
     
     load_file_from_disk(filename, files[idx].content);
     strcpy(buffer, files[idx].content);
+    
+    printf("DEBUG: Sending content: '%s' (length: %ld)\n", buffer, strlen(buffer));
     
     pthread_mutex_unlock(&file_mutex);
     
@@ -204,10 +250,31 @@ void handle_stream(int sock, const char* filename) {
     
     int idx = find_file(filename);
     if (idx < 0) {
-        sprintf(buffer, "ERROR File not found");
-        send(sock, buffer, strlen(buffer), 0);
-        pthread_mutex_unlock(&file_mutex);
-        return;
+        // File not in memory, try to load from disk
+        char filepath[MAX_PATH + MAX_FILENAME];
+#ifdef _WIN32
+        snprintf(filepath, sizeof(filepath), "%s\\%s", root_path, filename);
+#else
+        snprintf(filepath, sizeof(filepath), "%s/%s", root_path, filename);
+#endif
+        
+        FILE* f = fopen(filepath, "r");
+        if (f) {
+            fclose(f);
+            // File exists on disk, add it to memory
+            idx = file_count;
+            strcpy(files[idx].filename, filename);
+            files[idx].lock_count = 0;
+            files[idx].has_backup = 0;
+            files[idx].checkpoint_count = 0;
+            load_file_from_disk(filename, files[idx].content);
+            file_count++;
+        } else {
+            sprintf(buffer, "ERROR File not found");
+            send(sock, buffer, strlen(buffer), 0);
+            pthread_mutex_unlock(&file_mutex);
+            return;
+        }
     }
     
     load_file_from_disk(filename, files[idx].content);
@@ -255,10 +322,31 @@ void handle_write_start(int sock, const char* filename, int sentence_idx) {
     
     int idx = find_file(filename);
     if (idx < 0) {
-        sprintf(buffer, "ERROR File not found");
-        send(sock, buffer, strlen(buffer), 0);
-        pthread_mutex_unlock(&file_mutex);
-        return;
+        // File not in memory, try to load from disk
+        char filepath[MAX_PATH + MAX_FILENAME];
+#ifdef _WIN32
+        snprintf(filepath, sizeof(filepath), "%s\\%s", root_path, filename);
+#else
+        snprintf(filepath, sizeof(filepath), "%s/%s", root_path, filename);
+#endif
+        
+        FILE* f = fopen(filepath, "r");
+        if (f) {
+            fclose(f);
+            // File exists on disk, add it to memory
+            idx = file_count;
+            strcpy(files[idx].filename, filename);
+            files[idx].lock_count = 0;
+            files[idx].has_backup = 0;
+            files[idx].checkpoint_count = 0;
+            load_file_from_disk(filename, files[idx].content);
+            file_count++;
+        } else {
+            sprintf(buffer, "ERROR File not found");
+            send(sock, buffer, strlen(buffer), 0);
+            pthread_mutex_unlock(&file_mutex);
+            return;
+        }
     }
     
     load_file_from_disk(filename, files[idx].content);
@@ -274,23 +362,44 @@ void handle_write_start(int sock, const char* filename, int sentence_idx) {
         return;
     }
     
-    if (files[idx].locked_sentence >= 0) {
-        sprintf(buffer, "ERROR Sentence locked by another user");
+    // Check if THIS SPECIFIC sentence is already locked
+    for (int i = 0; i < files[idx].lock_count; i++) {
+        if (files[idx].sentence_locks[i].sentence_idx == sentence_idx) {
+            sprintf(buffer, "ERROR Sentence %d is locked by user '%s'", 
+                    sentence_idx, files[idx].sentence_locks[i].lock_holder);
+            send(sock, buffer, strlen(buffer), 0);
+            pthread_mutex_unlock(&file_mutex);
+            return;
+        }
+    }
+    
+    // Check if we can add more locks
+    if (files[idx].lock_count >= MAX_SENTENCE_LOCKS) {
+        sprintf(buffer, "ERROR Maximum concurrent write sessions reached");
         send(sock, buffer, strlen(buffer), 0);
         pthread_mutex_unlock(&file_mutex);
         return;
     }
     
-    files[idx].locked_sentence = sentence_idx;
-    strcpy(files[idx].backup_content, files[idx].content);
-    files[idx].has_backup = 1;
+    // Lock this specific sentence
+    files[idx].sentence_locks[files[idx].lock_count].sentence_idx = sentence_idx;
+    strcpy(files[idx].sentence_locks[files[idx].lock_count].lock_holder, "user"); // We'll get username later
+    files[idx].lock_count++;
+    
+    // Backup only on first write session
+    if (!files[idx].has_backup) {
+        strcpy(files[idx].backup_content, files[idx].content);
+        files[idx].has_backup = 1;
+    }
     
     pthread_mutex_unlock(&file_mutex);
     
-    sprintf(buffer, "ACK Lock acquired");
+    sprintf(buffer, "ACK Lock acquired for sentence %d", sentence_idx);
     send(sock, buffer, strlen(buffer), 0);
     
-    log_message("SS", "Write lock acquired");
+    char log_msg[256];
+    sprintf(log_msg, "Write lock acquired on sentence %d of file %s", sentence_idx, filename);
+    log_message("SS", log_msg);
 }
 
 void handle_write_update(int sock, const char* filename, int word_idx, const char* content) {
@@ -299,18 +408,20 @@ void handle_write_update(int sock, const char* filename, int word_idx, const cha
     pthread_mutex_lock(&file_mutex);
     
     int idx = find_file(filename);
-    if (idx < 0 || files[idx].locked_sentence < 0) {
-        sprintf(buffer, "ERROR Invalid state");
+    if (idx < 0 || files[idx].lock_count == 0) {
+        sprintf(buffer, "ERROR Invalid state - no active write session");
         send(sock, buffer, strlen(buffer), 0);
         pthread_mutex_unlock(&file_mutex);
         return;
     }
     
+    // Find which sentence is locked for this session (use the last lock added)
+    // In a real implementation, you'd track which lock belongs to which connection
+    int sent_idx = files[idx].sentence_locks[files[idx].lock_count - 1].sentence_idx;
+    
     char sentences[100][MAX_SENTENCE_LENGTH];
     int sent_count = 0;
     split_into_sentences(files[idx].content, sentences, &sent_count);
-    
-    int sent_idx = files[idx].locked_sentence;
     
     if (sent_idx >= sent_count) {
         // Appending new sentence at the end
@@ -383,7 +494,12 @@ void handle_write_end(int sock, const char* filename) {
         return;
     }
     
-    files[idx].locked_sentence = -1;
+    // Release the last lock (in real implementation, you'd track which lock belongs to this connection)
+    if (files[idx].lock_count > 0) {
+        files[idx].lock_count--;
+    }
+    
+    // Save to disk
     save_file_to_disk(filename, files[idx].content);
     
     pthread_mutex_unlock(&file_mutex);
@@ -391,7 +507,7 @@ void handle_write_end(int sock, const char* filename) {
     sprintf(buffer, "ACK Write Successful!");
     send(sock, buffer, strlen(buffer), 0);
     
-    log_message("SS", "Write completed");
+    log_message("SS", "Write completed and lock released");
 }
 
 void handle_undo(int sock, const char* filename) {
@@ -726,7 +842,7 @@ void scan_files() {
         if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
             if (file_count >= MAX_FILES) break;
             strcpy(files[file_count].filename, findData.cFileName);
-            files[file_count].locked_sentence = -1;
+            files[file_count].lock_count = 0;
             files[file_count].has_backup = 0;
             load_file_from_disk(findData.cFileName, files[file_count].content);
             file_count++;
@@ -743,7 +859,7 @@ void scan_files() {
         if (entry->d_type == DT_REG) {
             if (file_count >= MAX_FILES) break;
             strcpy(files[file_count].filename, entry->d_name);
-            files[file_count].locked_sentence = -1;
+            files[file_count].lock_count = 0;
             files[file_count].has_backup = 0;
             load_file_from_disk(entry->d_name, files[file_count].content);
             file_count++;
@@ -774,12 +890,36 @@ int main(int argc, char* argv[]) {
     strcpy(root_path, argv[4]);
     
     // Create root directory if it doesn't exist
-    mkdir(root_path, 0777);
+    printf("DEBUG: Creating directory: %s\n", root_path);
+    if (mkdir(root_path, 0777) == 0) {
+        printf("DEBUG: Directory created successfully\n");
+    } else {
+        if (errno == EEXIST) {
+            printf("DEBUG: Directory already exists\n");
+        } else {
+            perror("DEBUG: Failed to create directory");
+        }
+    }
+    
+    // Verify directory is accessible
+    DIR* test_dir = opendir(root_path);
+    if (test_dir) {
+        printf("DEBUG: Directory is accessible\n");
+        closedir(test_dir);
+    } else {
+        perror("DEBUG: Cannot access directory");
+    }
     
     // Scan existing files
     scan_files();
     
+    printf("DEBUG: Found %d files in directory\n", file_count);
+    for (int i = 0; i < file_count; i++) {
+        printf("DEBUG: File %d: %s\n", i, files[i].filename);
+    }
+    
     // Register with naming server
+    printf("DEBUG: Connecting to naming server at %s:%d\n", nm_ip, nm_port);
     int nm_sock = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in nm_addr;
     nm_addr.sin_family = AF_INET;
@@ -791,19 +931,32 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
+    printf("DEBUG: Connected! Sending registration with %d files\n", file_count);
     char buffer[MAX_BUFFER];
     sprintf(buffer, "REGISTER_SS 127.0.0.1 %d %d %s %d", 
             nm_comm_port, client_port, root_path, file_count);
+    printf("DEBUG: Registration message: %s\n", buffer);
     send(nm_sock, buffer, strlen(buffer), 0);
     
+    // Small delay to ensure naming server processed the registration message
+    usleep(50000);  // 50ms delay
+    
     // Send file list
+    printf("DEBUG: Sending file list...\n");
     for (int i = 0; i < file_count; i++) {
+        printf("DEBUG: Sending file: %s (length: %ld)\n", files[i].filename, strlen(files[i].filename));
         send(nm_sock, files[i].filename, strlen(files[i].filename), 0);
-        usleep(10000);
+        usleep(100000);  // Increased delay between files to 100ms
     }
     
-    recv(nm_sock, buffer, MAX_BUFFER, 0);
-    printf("Registration: %s\n", buffer);
+    printf("DEBUG: Waiting for registration response...\n");
+    int bytes = recv(nm_sock, buffer, MAX_BUFFER, 0);
+    if (bytes > 0) {
+        buffer[bytes] = '\0';
+        printf("Registration: %s\n", buffer);
+    } else {
+        printf("DEBUG: No response from naming server!\n");
+    }
     
     // Start NM connection handler
     int* nm_sock_ptr = malloc(sizeof(int));

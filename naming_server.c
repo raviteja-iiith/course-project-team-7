@@ -59,6 +59,34 @@ void trie_insert(const char* filename, int file_index) {
     curr->file_index = file_index;
 }
 
+void free_trie(TrieNode* node) {
+    if (!node) return;
+    for (int i = 0; i < 128; i++) {
+        if (node->children[i]) {
+            free_trie(node->children[i]);
+        }
+    }
+    free(node);
+}
+
+void rebuild_trie() {
+    // Free old trie
+    if (trie_root) {
+        free_trie(trie_root);
+        trie_root = NULL;
+    }
+    
+    // Rebuild from current file list
+    for (int i = 0; i < file_count; i++) {
+        trie_insert(files[i].filename, i);
+    }
+    
+    // Clear cache as indices may have changed
+    pthread_mutex_lock(&cache_mutex);
+    cache_count = 0;
+    pthread_mutex_unlock(&cache_mutex);
+}
+
 int trie_search(const char* filename) {
     if (!trie_root) return -1;
     TrieNode* curr = trie_root;
@@ -140,6 +168,14 @@ void save_metadata() {
         fwrite(&folders[i], sizeof(FolderMetadata), 1, f);
     }
     
+    // Save client/user metadata
+    pthread_mutex_lock(&client_mutex);
+    fwrite(&client_count, sizeof(int), 1, f);
+    for (int i = 0; i < client_count; i++) {
+        fwrite(&clients[i], sizeof(ClientInfo), 1, f);
+    }
+    pthread_mutex_unlock(&client_mutex);
+    
     fclose(f);
     log_message("NM", "Metadata saved to disk");
 }
@@ -155,7 +191,6 @@ void load_metadata() {
     fread(&file_count, sizeof(int), 1, f);
     for (int i = 0; i < file_count; i++) {
         fread(&files[i], sizeof(FileMetadata), 1, f);
-        trie_insert(files[i].filename, i);  // Rebuild trie
     }
     
     // Load folder metadata
@@ -164,10 +199,23 @@ void load_metadata() {
         fread(&folders[i], sizeof(FolderMetadata), 1, f);
     }
     
+    // Load client/user metadata
+    pthread_mutex_lock(&client_mutex);
+    fread(&client_count, sizeof(int), 1, f);
+    for (int i = 0; i < client_count; i++) {
+        fread(&clients[i], sizeof(ClientInfo), 1, f);
+        // Mark all clients as inactive on startup (they need to reconnect)
+        clients[i].active = 0;
+    }
+    pthread_mutex_unlock(&client_mutex);
+    
     fclose(f);
     
+    // Rebuild trie from loaded files
+    rebuild_trie();
+    
     char log_msg[256];
-    sprintf(log_msg, "Metadata loaded: %d files, %d folders", file_count, folder_count);
+    sprintf(log_msg, "Metadata loaded: %d files, %d folders, %d users", file_count, folder_count, client_count);
     log_message("NM", log_msg);
 }
 
@@ -294,59 +342,97 @@ void handle_register_ss(int client_sock, const char* received_buffer) {
     
     sscanf(buffer, "REGISTER_SS %s %d %d %s %d", ip, &nm_port, &client_port, root_path, &num_files);
     
+    printf("DEBUG NM: Registering SS: ip=%s, nm_port=%d, client_port=%d, files=%d\n", 
+           ip, nm_port, client_port, num_files);
+    
     pthread_mutex_lock(&ss_mutex);
-    int ss_idx = ss_count;
-    strcpy(storage_servers[ss_idx].ip, ip);
-    storage_servers[ss_idx].nm_port = nm_port;
-    storage_servers[ss_idx].client_port = client_port;
-    storage_servers[ss_idx].active = 1;
-    strcpy(storage_servers[ss_idx].root_path, root_path);
-    ss_count++;
+    
+    // Check if this storage server is already registered (reconnection)
+    int ss_idx = -1;
+    for (int i = 0; i < ss_count; i++) {
+        if (strcmp(storage_servers[i].ip, ip) == 0 && 
+            storage_servers[i].nm_port == nm_port && 
+            storage_servers[i].client_port == client_port) {
+            ss_idx = i;
+            storage_servers[i].active = 1;  // Mark as active again
+            printf("DEBUG NM: Found existing SS at index %d, marking active\n", ss_idx);
+            break;
+        }
+    }
+    
+    // If not found, register as new storage server
+    if (ss_idx == -1) {
+        ss_idx = ss_count;
+        strcpy(storage_servers[ss_idx].ip, ip);
+        storage_servers[ss_idx].nm_port = nm_port;
+        storage_servers[ss_idx].client_port = client_port;
+        storage_servers[ss_idx].active = 1;
+        strcpy(storage_servers[ss_idx].root_path, root_path);
+        ss_count++;
+        printf("DEBUG NM: New SS registered at index %d\n", ss_idx);
+    }
+    
     pthread_mutex_unlock(&ss_mutex);
     
-    // Receive file list
+    // Receive file list and register/update files
+    printf("DEBUG NM: Receiving %d files...\n", num_files);
     for (int i = 0; i < num_files; i++) {
-        recv(client_sock, buffer, MAX_BUFFER, 0);
+        memset(buffer, 0, MAX_BUFFER);  // Clear buffer
+        
+        // Set timeout for receiving
+        struct timeval timeout;
+        timeout.tv_sec = 5;
+        timeout.tv_usec = 0;
+        setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        
+        int bytes = recv(client_sock, buffer, MAX_BUFFER, 0);
+        if (bytes <= 0) {
+            printf("DEBUG NM: Failed to receive file %d (bytes=%d, errno=%d)\n", i, bytes, errno);
+            break;
+        }
+        buffer[bytes] = '\0';  // Null terminate
+        
+        printf("DEBUG NM: Received file %d: '%s' (bytes: %d)\n", i, buffer, bytes);
         
         pthread_mutex_lock(&file_mutex);
-        int file_idx = file_count;
-        strcpy(files[file_idx].filename, buffer);
-        strcpy(files[file_idx].owner, "system");
-        files[file_idx].created = time(NULL);
-        files[file_idx].last_modified = time(NULL);
-        files[file_idx].last_accessed = time(NULL);
-        files[file_idx].ss_index = ss_idx;
-        files[file_idx].access_count = 0;
-        files[file_idx].word_count = 0;
-        files[file_idx].char_count = 0;
-        files[file_idx].folder[0] = '\0';  // Root folder
         
-        trie_insert(files[file_idx].filename, file_idx);
-        file_count++;
+        // Check if file already exists in our metadata
+        int file_idx = find_file_index(buffer);
+        
+        if (file_idx < 0) {
+            // New file, add it
+            file_idx = file_count;
+            strcpy(files[file_idx].filename, buffer);
+            strcpy(files[file_idx].owner, "system");
+            files[file_idx].created = time(NULL);
+            files[file_idx].last_modified = time(NULL);
+            files[file_idx].last_accessed = time(NULL);
+            files[file_idx].ss_index = ss_idx;
+            files[file_idx].access_count = 0;
+            files[file_idx].word_count = 0;
+            files[file_idx].char_count = 0;
+            files[file_idx].folder[0] = '\0';  // Root folder
+            
+            trie_insert(files[file_idx].filename, file_idx);
+            file_count++;
+            printf("DEBUG NM: Added new file '%s' at index %d\n", files[file_idx].filename, file_idx);
+        } else {
+            // File exists, update its storage server index
+            files[file_idx].ss_index = ss_idx;
+            printf("DEBUG NM: Updated existing file '%s' to SS index %d\n", buffer, ss_idx);
+        }
+        
         pthread_mutex_unlock(&file_mutex);
     }
     
+    printf("DEBUG NM: All files received, sending ACK\n");
     sprintf(buffer, "ACK SS registered: %d files", num_files);
     send(client_sock, buffer, strlen(buffer), 0);
+    printf("DEBUG NM: ACK sent\n");
     
-    log_message("NM", "Storage Server registered");
-    
-    // Add a system file for testing VIEW vs VIEW -a
-    pthread_mutex_lock(&file_mutex);
-    int sys_file_idx = file_count;
-    strcpy(files[sys_file_idx].filename, "system.log");
-    strcpy(files[sys_file_idx].owner, "system");
-    files[sys_file_idx].created = time(NULL);
-    files[sys_file_idx].last_modified = time(NULL);
-    files[sys_file_idx].last_accessed = time(NULL);
-    files[sys_file_idx].ss_index = ss_idx;
-    files[sys_file_idx].access_count = 0;
-    files[sys_file_idx].word_count = 42;
-    files[sys_file_idx].char_count = 1024;
-    
-    trie_insert(files[sys_file_idx].filename, sys_file_idx);
-    file_count++;
-    pthread_mutex_unlock(&file_mutex);
+    char log_msg[256];
+    sprintf(log_msg, "Storage Server registered/reconnected at %s:%d with %d files", ip, client_port, num_files);
+    log_message("NM", log_msg);
 }
 
 void handle_register_client(int client_sock, const char* received_buffer) {
@@ -367,6 +453,7 @@ void handle_register_client(int client_sock, const char* received_buffer) {
         }
     }
     
+    int is_new_client = 0;
     if (existing_client >= 0) {
         // Update existing client
         strcpy(clients[existing_client].ip, ip);
@@ -382,6 +469,7 @@ void handle_register_client(int client_sock, const char* received_buffer) {
         clients[client_idx].port = port;
         clients[client_idx].active = 1;
         client_count++;
+        is_new_client = 1;
         
         sprintf(buffer, "ACK Client registered: %s", username);
         log_detailed("NM", "Client registered", username, ip, port);
@@ -389,6 +477,11 @@ void handle_register_client(int client_sock, const char* received_buffer) {
     
     pthread_mutex_unlock(&client_mutex);
     send(client_sock, buffer, strlen(buffer), 0);
+    
+    // Save metadata after releasing lock and sending response
+    if (is_new_client) {
+        save_metadata();
+    }
 }
 
 void handle_view_files(int client_sock, const char* username, const char* flags) {
@@ -564,6 +657,13 @@ void handle_delete_file(int client_sock, const char* filename, const char* usern
     ss_addr.sin_port = htons(storage_servers[ss_idx].nm_port);
     inet_pton(AF_INET, storage_servers[ss_idx].ip, &ss_addr.sin_addr);
     
+    // Set connection timeout
+    struct timeval timeout;
+    timeout.tv_sec = 2;
+    timeout.tv_usec = 0;
+    setsockopt(ss_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(ss_sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    
     if (connect(ss_sock, (struct sockaddr*)&ss_addr, sizeof(ss_addr)) == 0) {
         sprintf(buffer, "DELETE %s", filename);
         send(ss_sock, buffer, strlen(buffer), 0);
@@ -571,17 +671,14 @@ void handle_delete_file(int client_sock, const char* filename, const char* usern
     }
     close(ss_sock);
     
-    // Remove from file list
+    // Remove from file list by shifting all elements after it
     for (int i = file_idx; i < file_count - 1; i++) {
         files[i] = files[i + 1];
     }
     file_count--;
     
-    // Rebuild trie
-    trie_root = NULL;
-    for (int i = 0; i < file_count; i++) {
-        trie_insert(files[i].filename, i);
-    }
+    // Rebuild trie with updated indices
+    rebuild_trie();
     
     pthread_mutex_unlock(&file_mutex);
     
@@ -779,6 +876,18 @@ void handle_get_ss_info(int client_sock, const char* filename, const char* usern
     }
     
     int ss_idx = files[file_idx].ss_index;
+    
+    // Check if storage server is still active/available
+    pthread_mutex_lock(&ss_mutex);
+    if (ss_idx >= ss_count || !storage_servers[ss_idx].active) {
+        pthread_mutex_unlock(&ss_mutex);
+        pthread_mutex_unlock(&file_mutex);
+        sprintf(buffer, "ERROR Storage server is currently unavailable");
+        send(client_sock, buffer, strlen(buffer), 0);
+        return;
+    }
+    pthread_mutex_unlock(&ss_mutex);
+    
     files[file_idx].last_accessed = time(NULL);
     
     // For write operations, get current file content to update metadata
@@ -790,6 +899,13 @@ void handle_get_ss_info(int client_sock, const char* filename, const char* usern
         ss_addr.sin_port = htons(storage_servers[ss_idx].nm_port);
         inet_pton(AF_INET, storage_servers[ss_idx].ip, &ss_addr.sin_addr);
         
+        // Set connection timeout
+        struct timeval timeout;
+        timeout.tv_sec = 2;
+        timeout.tv_usec = 0;
+        setsockopt(ss_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        setsockopt(ss_sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        
         if (connect(ss_sock, (struct sockaddr*)&ss_addr, sizeof(ss_addr)) == 0) {
             sprintf(buffer, "GETFILE %s", filename);
             send(ss_sock, buffer, strlen(buffer), 0);
@@ -799,8 +915,18 @@ void handle_get_ss_info(int client_sock, const char* filename, const char* usern
                 content[bytes] = '\0';
                 update_file_metadata(file_idx, content);
             }
+            close(ss_sock);
+        } else {
+            // Storage server is down, mark as inactive
+            pthread_mutex_lock(&ss_mutex);
+            storage_servers[ss_idx].active = 0;
+            pthread_mutex_unlock(&ss_mutex);
+            pthread_mutex_unlock(&file_mutex);
+            close(ss_sock);
+            sprintf(buffer, "ERROR Storage server is currently unavailable");
+            send(client_sock, buffer, strlen(buffer), 0);
+            return;
         }
-        close(ss_sock);
     }
     
     sprintf(buffer, "SS_INFO %s %d", storage_servers[ss_idx].ip, 
