@@ -175,8 +175,6 @@ void cmd_write(char* filename, int sentence_idx) {
     }
     buffer[bytes] = '\0';
     
-    printf("Debug: NM response: '%s'\n", buffer);
-    
     if (strncmp(buffer, "ERROR", 5) == 0) {
         printf("%s\n", buffer + 6);
         close(sock);
@@ -191,7 +189,6 @@ void cmd_write(char* filename, int sentence_idx) {
         return;
     }
     
-    printf("Debug: Connecting to SS at %s:%d\n", ss_ip, ss_port);
     close(sock);
     
     // Connect to SS
@@ -202,7 +199,7 @@ void cmd_write(char* filename, int sentence_idx) {
     }
     
     // Start write
-    sprintf(buffer, "WRITE_START %s %d", filename, sentence_idx);
+    sprintf(buffer, "WRITE_START %s %d %s", filename, sentence_idx, username);
     send(ss_sock, buffer, strlen(buffer), 0);
     
     bytes = recv(ss_sock, buffer, MAX_BUFFER, 0);

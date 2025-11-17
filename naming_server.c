@@ -342,9 +342,6 @@ void handle_register_ss(int client_sock, const char* received_buffer) {
     
     sscanf(buffer, "REGISTER_SS %s %d %d %s %d", ip, &nm_port, &client_port, root_path, &num_files);
     
-    printf("DEBUG NM: Registering SS: ip=%s, nm_port=%d, client_port=%d, files=%d\n", 
-           ip, nm_port, client_port, num_files);
-    
     pthread_mutex_lock(&ss_mutex);
     
     // Check if this storage server is already registered (reconnection)
@@ -355,7 +352,6 @@ void handle_register_ss(int client_sock, const char* received_buffer) {
             storage_servers[i].client_port == client_port) {
             ss_idx = i;
             storage_servers[i].active = 1;  // Mark as active again
-            printf("DEBUG NM: Found existing SS at index %d, marking active\n", ss_idx);
             break;
         }
     }
@@ -369,13 +365,11 @@ void handle_register_ss(int client_sock, const char* received_buffer) {
         storage_servers[ss_idx].active = 1;
         strcpy(storage_servers[ss_idx].root_path, root_path);
         ss_count++;
-        printf("DEBUG NM: New SS registered at index %d\n", ss_idx);
     }
     
     pthread_mutex_unlock(&ss_mutex);
     
     // Receive file list and register/update files
-    printf("DEBUG NM: Receiving %d files...\n", num_files);
     for (int i = 0; i < num_files; i++) {
         memset(buffer, 0, MAX_BUFFER);  // Clear buffer
         
@@ -387,12 +381,9 @@ void handle_register_ss(int client_sock, const char* received_buffer) {
         
         int bytes = recv(client_sock, buffer, MAX_BUFFER, 0);
         if (bytes <= 0) {
-            printf("DEBUG NM: Failed to receive file %d (bytes=%d, errno=%d)\n", i, bytes, errno);
             break;
         }
         buffer[bytes] = '\0';  // Null terminate
-        
-        printf("DEBUG NM: Received file %d: '%s' (bytes: %d)\n", i, buffer, bytes);
         
         pthread_mutex_lock(&file_mutex);
         
@@ -415,20 +406,16 @@ void handle_register_ss(int client_sock, const char* received_buffer) {
             
             trie_insert(files[file_idx].filename, file_idx);
             file_count++;
-            printf("DEBUG NM: Added new file '%s' at index %d\n", files[file_idx].filename, file_idx);
         } else {
             // File exists, update its storage server index
             files[file_idx].ss_index = ss_idx;
-            printf("DEBUG NM: Updated existing file '%s' to SS index %d\n", buffer, ss_idx);
         }
         
         pthread_mutex_unlock(&file_mutex);
     }
     
-    printf("DEBUG NM: All files received, sending ACK\n");
     sprintf(buffer, "ACK SS registered: %d files", num_files);
     send(client_sock, buffer, strlen(buffer), 0);
-    printf("DEBUG NM: ACK sent\n");
     
     char log_msg[256];
     sprintf(log_msg, "Storage Server registered/reconnected at %s:%d with %d files", ip, client_port, num_files);
@@ -585,9 +572,6 @@ void handle_create_file(int client_sock, const char* filename, const char* usern
     
     // Try to send create command to SS (optional - file creation works without it)
     if (ss_count > 0) {
-        printf("DEBUG: Attempting to send CREATE to SS at %s:%d\n", 
-               storage_servers[selected_ss].ip, storage_servers[selected_ss].nm_port);
-        
         int ss_sock = socket(AF_INET, SOCK_STREAM, 0);
         if (ss_sock >= 0) {
             struct sockaddr_in ss_addr;
@@ -596,7 +580,6 @@ void handle_create_file(int client_sock, const char* filename, const char* usern
             inet_pton(AF_INET, storage_servers[selected_ss].ip, &ss_addr.sin_addr);
             
             if (connect(ss_sock, (struct sockaddr*)&ss_addr, sizeof(ss_addr)) == 0) {
-                printf("DEBUG: Connected to SS, sending CREATE command\n");
                 sprintf(buffer, "CREATE %s", filename);
                 send(ss_sock, buffer, strlen(buffer), 0);
                 
@@ -612,11 +595,8 @@ void handle_create_file(int client_sock, const char* filename, const char* usern
                     int bytes = recv(ss_sock, buffer, MAX_BUFFER, 0);
                     if (bytes > 0) {
                         buffer[bytes] = '\0';
-                        printf("DEBUG: SS responded: %s\n", buffer);
                     }
                 }
-            } else {
-                printf("DEBUG: Failed to connect to SS at port %d\n", storage_servers[selected_ss].nm_port);
             }
             close(ss_sock);
         }
@@ -890,43 +870,40 @@ void handle_get_ss_info(int client_sock, const char* filename, const char* usern
     
     files[file_idx].last_accessed = time(NULL);
     
-    // For write operations, get current file content to update metadata
-    if (required_access == 2) { // Write access
-        // Connect to SS to get current file content
-        int ss_sock = socket(AF_INET, SOCK_STREAM, 0);
-        struct sockaddr_in ss_addr;
-        ss_addr.sin_family = AF_INET;
-        ss_addr.sin_port = htons(storage_servers[ss_idx].nm_port);
-        inet_pton(AF_INET, storage_servers[ss_idx].ip, &ss_addr.sin_addr);
-        
-        // Set connection timeout
-        struct timeval timeout;
-        timeout.tv_sec = 2;
-        timeout.tv_usec = 0;
-        setsockopt(ss_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-        setsockopt(ss_sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-        
-        if (connect(ss_sock, (struct sockaddr*)&ss_addr, sizeof(ss_addr)) == 0) {
-            sprintf(buffer, "GETFILE %s", filename);
-            send(ss_sock, buffer, strlen(buffer), 0);
-            char content[MAX_BUFFER] = {0};
-            int bytes = recv(ss_sock, content, MAX_BUFFER - 1, 0);
-            if (bytes > 0) {
-                content[bytes] = '\0';
-                update_file_metadata(file_idx, content);
-            }
-            close(ss_sock);
-        } else {
-            // Storage server is down, mark as inactive
-            pthread_mutex_lock(&ss_mutex);
-            storage_servers[ss_idx].active = 0;
-            pthread_mutex_unlock(&ss_mutex);
-            pthread_mutex_unlock(&file_mutex);
-            close(ss_sock);
-            sprintf(buffer, "ERROR Storage server is currently unavailable");
-            send(client_sock, buffer, strlen(buffer), 0);
-            return;
+    // Get current file content from SS to update metadata (for both read and write)
+    int ss_sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in ss_addr;
+    ss_addr.sin_family = AF_INET;
+    ss_addr.sin_port = htons(storage_servers[ss_idx].nm_port);
+    inet_pton(AF_INET, storage_servers[ss_idx].ip, &ss_addr.sin_addr);
+    
+    // Set connection timeout
+    struct timeval timeout;
+    timeout.tv_sec = 2;
+    timeout.tv_usec = 0;
+    setsockopt(ss_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(ss_sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    
+    if (connect(ss_sock, (struct sockaddr*)&ss_addr, sizeof(ss_addr)) == 0) {
+        sprintf(buffer, "GETFILE %s", filename);
+        send(ss_sock, buffer, strlen(buffer), 0);
+        char content[MAX_BUFFER] = {0};
+        int bytes = recv(ss_sock, content, MAX_BUFFER - 1, 0);
+        if (bytes > 0) {
+            content[bytes] = '\0';
+            update_file_metadata(file_idx, content);
         }
+        close(ss_sock);
+    } else {
+        // Storage server is down, mark as inactive
+        pthread_mutex_lock(&ss_mutex);
+        storage_servers[ss_idx].active = 0;
+        pthread_mutex_unlock(&ss_mutex);
+        pthread_mutex_unlock(&file_mutex);
+        close(ss_sock);
+        sprintf(buffer, "ERROR Storage server is currently unavailable");
+        send(client_sock, buffer, strlen(buffer), 0);
+        return;
     }
     
     sprintf(buffer, "SS_INFO %s %d", storage_servers[ss_idx].ip, 

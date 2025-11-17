@@ -32,14 +32,10 @@ void save_file_to_disk(const char* filename, const char* content) {
 #else
     snprintf(filepath, sizeof(filepath), "%s/%s", root_path, filename);
 #endif
-    printf("DEBUG save_file_to_disk: Saving '%s' to %s\n", content, filepath);
     FILE* f = fopen(filepath, "w");
     if (f) {
         fputs(content, f);
         fclose(f);
-        printf("DEBUG save_file_to_disk: File saved successfully\n");
-    } else {
-        printf("DEBUG save_file_to_disk: Failed to open file for writing!\n");
     }
 }
 
@@ -51,15 +47,11 @@ void load_file_from_disk(const char* filename, char* content) {
     snprintf(filepath, sizeof(filepath), "%s/%s", root_path, filename);
 #endif
     content[0] = '\0';  // Initialize to empty
-    printf("DEBUG load_file_from_disk: Loading from %s\n", filepath);
     FILE* f = fopen(filepath, "r");
     if (f) {
         fread(content, 1, MAX_BUFFER - 1, f);
         content[MAX_BUFFER - 1] = '\0';  // Ensure null termination
         fclose(f);
-        printf("DEBUG load_file_from_disk: Loaded content: '%s' (length: %ld)\n", content, strlen(content));
-    } else {
-        printf("DEBUG load_file_from_disk: Failed to open file for reading!\n");
     }
 }
 
@@ -192,12 +184,9 @@ void handle_delete(int sock, const char* filename) {
 void handle_read(int sock, const char* filename) {
     char buffer[MAX_BUFFER];
     
-    printf("DEBUG: handle_read called for file: %s\n", filename);
-    
     pthread_mutex_lock(&file_mutex);
     
     int idx = find_file(filename);
-    printf("DEBUG: find_file returned idx: %d\n", idx);
     
     if (idx < 0) {
         // File not in memory, try to load from disk
@@ -208,11 +197,9 @@ void handle_read(int sock, const char* filename) {
         snprintf(filepath, sizeof(filepath), "%s/%s", root_path, filename);
 #endif
         
-        printf("DEBUG: Trying to open file at: %s\n", filepath);
         FILE* f = fopen(filepath, "r");
         if (f) {
             fclose(f);
-            printf("DEBUG: File found on disk, adding to memory\n");
             // File exists on disk, add it to memory
             idx = file_count;
             strcpy(files[idx].filename, filename);
@@ -221,9 +208,7 @@ void handle_read(int sock, const char* filename) {
             files[idx].checkpoint_count = 0;
             load_file_from_disk(filename, files[idx].content);
             file_count++;
-            printf("DEBUG: File loaded. Content length: %ld\n", strlen(files[idx].content));
         } else {
-            printf("DEBUG: File not found on disk\n");
             sprintf(buffer, "ERROR File not found");
             send(sock, buffer, strlen(buffer), 0);
             pthread_mutex_unlock(&file_mutex);
@@ -233,8 +218,6 @@ void handle_read(int sock, const char* filename) {
     
     load_file_from_disk(filename, files[idx].content);
     strcpy(buffer, files[idx].content);
-    
-    printf("DEBUG: Sending content: '%s' (length: %ld)\n", buffer, strlen(buffer));
     
     pthread_mutex_unlock(&file_mutex);
     
@@ -315,7 +298,7 @@ void handle_stream(int sock, const char* filename) {
     log_message("SS", "File streamed");
 }
 
-void handle_write_start(int sock, const char* filename, int sentence_idx) {
+void handle_write_start(int sock, const char* filename, int sentence_idx, const char* username) {
     char buffer[MAX_BUFFER];
     
     pthread_mutex_lock(&file_mutex);
@@ -383,7 +366,7 @@ void handle_write_start(int sock, const char* filename, int sentence_idx) {
     
     // Lock this specific sentence
     files[idx].sentence_locks[files[idx].lock_count].sentence_idx = sentence_idx;
-    strcpy(files[idx].sentence_locks[files[idx].lock_count].lock_holder, "user"); // We'll get username later
+    strcpy(files[idx].sentence_locks[files[idx].lock_count].lock_holder, username);
     files[idx].lock_count++;
     
     // Backup only on first write session
@@ -501,6 +484,10 @@ void handle_write_end(int sock, const char* filename) {
     
     // Save to disk
     save_file_to_disk(filename, files[idx].content);
+    
+    // Update backup to current content for next UNDO (captures state before the NEXT write)
+    strcpy(files[idx].backup_content, files[idx].content);
+    files[idx].has_backup = 1;
     
     pthread_mutex_unlock(&file_mutex);
     
@@ -773,8 +760,9 @@ void* client_handler(void* arg) {
             handle_stream(sock, filename);
             break;  // Single command, close connection
         } else if (strcmp(command, "WRITE_START") == 0) {
-            sscanf(buffer, "%s %s %d", command, filename, &idx);
-            handle_write_start(sock, filename, idx);
+            char write_username[MAX_USERNAME];
+            sscanf(buffer, "%s %s %d %s", command, filename, &idx, write_username);
+            handle_write_start(sock, filename, idx, write_username);
             in_write_session = 1;  // Entered write session, keep connection open
         } else if (strcmp(command, "WRITE_UPDATE") == 0) {
             char* ptr = buffer + strlen("WRITE_UPDATE ");
@@ -890,36 +878,12 @@ int main(int argc, char* argv[]) {
     strcpy(root_path, argv[4]);
     
     // Create root directory if it doesn't exist
-    printf("DEBUG: Creating directory: %s\n", root_path);
-    if (mkdir(root_path, 0777) == 0) {
-        printf("DEBUG: Directory created successfully\n");
-    } else {
-        if (errno == EEXIST) {
-            printf("DEBUG: Directory already exists\n");
-        } else {
-            perror("DEBUG: Failed to create directory");
-        }
-    }
-    
-    // Verify directory is accessible
-    DIR* test_dir = opendir(root_path);
-    if (test_dir) {
-        printf("DEBUG: Directory is accessible\n");
-        closedir(test_dir);
-    } else {
-        perror("DEBUG: Cannot access directory");
-    }
+    mkdir(root_path, 0777);
     
     // Scan existing files
     scan_files();
     
-    printf("DEBUG: Found %d files in directory\n", file_count);
-    for (int i = 0; i < file_count; i++) {
-        printf("DEBUG: File %d: %s\n", i, files[i].filename);
-    }
-    
     // Register with naming server
-    printf("DEBUG: Connecting to naming server at %s:%d\n", nm_ip, nm_port);
     int nm_sock = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in nm_addr;
     nm_addr.sin_family = AF_INET;
@@ -931,31 +895,24 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    printf("DEBUG: Connected! Sending registration with %d files\n", file_count);
     char buffer[MAX_BUFFER];
     sprintf(buffer, "REGISTER_SS 127.0.0.1 %d %d %s %d", 
             nm_comm_port, client_port, root_path, file_count);
-    printf("DEBUG: Registration message: %s\n", buffer);
     send(nm_sock, buffer, strlen(buffer), 0);
     
     // Small delay to ensure naming server processed the registration message
     usleep(50000);  // 50ms delay
     
     // Send file list
-    printf("DEBUG: Sending file list...\n");
     for (int i = 0; i < file_count; i++) {
-        printf("DEBUG: Sending file: %s (length: %ld)\n", files[i].filename, strlen(files[i].filename));
         send(nm_sock, files[i].filename, strlen(files[i].filename), 0);
         usleep(100000);  // Increased delay between files to 100ms
     }
     
-    printf("DEBUG: Waiting for registration response...\n");
     int bytes = recv(nm_sock, buffer, MAX_BUFFER, 0);
     if (bytes > 0) {
         buffer[bytes] = '\0';
         printf("Registration: %s\n", buffer);
-    } else {
-        printf("DEBUG: No response from naming server!\n");
     }
     
     // Start NM connection handler

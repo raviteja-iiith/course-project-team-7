@@ -14,7 +14,7 @@ client: client.c common.c common.h
 	$(CC) $(CFLAGS) -o client client.c common.c $(LIBS)
 
 clean:
-	rm -f naming_server storage_server client *.o system.log
+	rm -f naming_server storage_server client *.o system.log nm_metadata.dat
 	rm -rf storage[0-9]*
 
 run_nm:
