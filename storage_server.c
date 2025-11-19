@@ -8,6 +8,7 @@ char backup_path[MAX_PATH];
 typedef struct {
     int sentence_idx;
     char lock_holder[MAX_USERNAME];
+    int session_fd; // socket fd that owns this lock
 } SentenceLock;
 
 typedef struct {
@@ -27,11 +28,8 @@ pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void save_file_to_disk(const char* filename, const char* content) {
     char filepath[MAX_PATH + MAX_FILENAME];
-#ifdef _WIN32
-    snprintf(filepath, sizeof(filepath), "%s\\%s", root_path, filename);
-#else
+    // POSIX path format
     snprintf(filepath, sizeof(filepath), "%s/%s", root_path, filename);
-#endif
     FILE* f = fopen(filepath, "w");
     if (f) {
         fputs(content, f);
@@ -41,11 +39,8 @@ void save_file_to_disk(const char* filename, const char* content) {
 
 void load_file_from_disk(const char* filename, char* content) {
     char filepath[MAX_PATH + MAX_FILENAME];
-#ifdef _WIN32
-    snprintf(filepath, sizeof(filepath), "%s\\%s", root_path, filename);
-#else
+    // POSIX path format
     snprintf(filepath, sizeof(filepath), "%s/%s", root_path, filename);
-#endif
     content[0] = '\0';  // Initialize to empty
     FILE* f = fopen(filepath, "r");
     if (f) {
@@ -160,11 +155,8 @@ void handle_delete(int sock, const char* filename) {
     
     // Delete from disk
     char filepath[MAX_PATH + MAX_FILENAME];
-#ifdef _WIN32
-    snprintf(filepath, sizeof(filepath), "%s\\%s", root_path, filename);
-#else
+    // POSIX path format
     snprintf(filepath, sizeof(filepath), "%s/%s", root_path, filename);
-#endif
     remove(filepath);
     
     // Remove from memory
@@ -190,12 +182,9 @@ void handle_read(int sock, const char* filename) {
     
     if (idx < 0) {
         // File not in memory, try to load from disk
-        char filepath[MAX_PATH + MAX_FILENAME];
-#ifdef _WIN32
-        snprintf(filepath, sizeof(filepath), "%s\\%s", root_path, filename);
-#else
-        snprintf(filepath, sizeof(filepath), "%s/%s", root_path, filename);
-#endif
+    char filepath[MAX_PATH + MAX_FILENAME];
+    // POSIX path format
+    snprintf(filepath, sizeof(filepath), "%s/%s", root_path, filename);
         
         FILE* f = fopen(filepath, "r");
         if (f) {
@@ -235,11 +224,8 @@ void handle_stream(int sock, const char* filename) {
     if (idx < 0) {
         // File not in memory, try to load from disk
         char filepath[MAX_PATH + MAX_FILENAME];
-#ifdef _WIN32
-        snprintf(filepath, sizeof(filepath), "%s\\%s", root_path, filename);
-#else
+        // POSIX path format
         snprintf(filepath, sizeof(filepath), "%s/%s", root_path, filename);
-#endif
         
         FILE* f = fopen(filepath, "r");
         if (f) {
@@ -307,11 +293,8 @@ void handle_write_start(int sock, const char* filename, int sentence_idx, const 
     if (idx < 0) {
         // File not in memory, try to load from disk
         char filepath[MAX_PATH + MAX_FILENAME];
-#ifdef _WIN32
-        snprintf(filepath, sizeof(filepath), "%s\\%s", root_path, filename);
-#else
+        // POSIX path format
         snprintf(filepath, sizeof(filepath), "%s/%s", root_path, filename);
-#endif
         
         FILE* f = fopen(filepath, "r");
         if (f) {
@@ -344,6 +327,20 @@ void handle_write_start(int sock, const char* filename, int sentence_idx, const 
         pthread_mutex_unlock(&file_mutex);
         return;
     }
+
+    // If client requests to create/append a new sentence at the end (sentence_idx == sent_count),
+    // ensure that the previous sentence (if any) ends with a sentence delimiter (. ! ?).
+    // This prevents creating sentence index N when sentence N-1 has no terminating delimiter.
+    if (sentence_idx == sent_count && sent_count > 0) {
+        int prev_len = strlen(sentences[sent_count - 1]);
+        char last = prev_len > 0 ? sentences[sent_count - 1][prev_len - 1] : '\0';
+        if (!(last == '.' || last == '!' || last == '?')) {
+            sprintf(buffer, "ERROR Cannot create new sentence: previous sentence missing delimiter");
+            send(sock, buffer, strlen(buffer), 0);
+            pthread_mutex_unlock(&file_mutex);
+            return;
+        }
+    }
     
     // Check if THIS SPECIFIC sentence is already locked
     for (int i = 0; i < files[idx].lock_count; i++) {
@@ -367,13 +364,12 @@ void handle_write_start(int sock, const char* filename, int sentence_idx, const 
     // Lock this specific sentence
     files[idx].sentence_locks[files[idx].lock_count].sentence_idx = sentence_idx;
     strcpy(files[idx].sentence_locks[files[idx].lock_count].lock_holder, username);
+    files[idx].sentence_locks[files[idx].lock_count].session_fd = sock;
     files[idx].lock_count++;
     
-    // Backup only on first write session
-    if (!files[idx].has_backup) {
-        strcpy(files[idx].backup_content, files[idx].content);
-        files[idx].has_backup = 1;
-    }
+    // Always capture backup at the start of a write session so UNDO reverts the last operation
+    strcpy(files[idx].backup_content, files[idx].content);
+    files[idx].has_backup = 1;
     
     pthread_mutex_unlock(&file_mutex);
     
@@ -398,9 +394,20 @@ void handle_write_update(int sock, const char* filename, int word_idx, const cha
         return;
     }
     
-    // Find which sentence is locked for this session (use the last lock added)
-    // In a real implementation, you'd track which lock belongs to which connection
-    int sent_idx = files[idx].sentence_locks[files[idx].lock_count - 1].sentence_idx;
+    // Find which sentence is locked for THIS session (match by socket fd)
+    int sent_idx = -1;
+    for (int i = 0; i < files[idx].lock_count; i++) {
+        if (files[idx].sentence_locks[i].session_fd == sock) {
+            sent_idx = files[idx].sentence_locks[i].sentence_idx;
+            break;
+        }
+    }
+    if (sent_idx == -1) {
+        sprintf(buffer, "ERROR Invalid state - no active write session for this connection");
+        send(sock, buffer, strlen(buffer), 0);
+        pthread_mutex_unlock(&file_mutex);
+        return;
+    }
     
     char sentences[100][MAX_SENTENCE_LENGTH];
     int sent_count = 0;
@@ -416,9 +423,20 @@ void handle_write_update(int sock, const char* filename, int word_idx, const cha
         }
         strcat(files[idx].content, content);
     } else {
+        // Preserve trailing sentence delimiter (.,!,?) so inserted words come before the delimiter
+        char temp_sentence[MAX_SENTENCE_LENGTH];
+        char delim = '\0';
+        strncpy(temp_sentence, sentences[sent_idx], sizeof(temp_sentence));
+        temp_sentence[sizeof(temp_sentence)-1] = '\0';
+        int tlen = strlen(temp_sentence);
+        if (tlen > 0 && (temp_sentence[tlen-1] == '.' || temp_sentence[tlen-1] == '!' || temp_sentence[tlen-1] == '?')) {
+            delim = temp_sentence[tlen-1];
+            temp_sentence[tlen-1] = '\0';
+        }
+
         char words[100][256];
         int word_count = 0;
-        split_into_words(sentences[sent_idx], words, &word_count);
+        split_into_words(temp_sentence, words, &word_count);
         
         // 1-based word indexing as per spec
         if (word_idx < 1 || word_idx > word_count + 1) {
@@ -439,6 +457,15 @@ void handle_write_update(int sock, const char* filename, int word_idx, const cha
         for (int i = word_idx - 1; i < word_count; i++) {
             strcat(new_sentence, " ");
             strcat(new_sentence, words[i]);
+        }
+
+        // Append the original sentence delimiter (if any) to keep punctuation at the end
+        if (delim != '\0') {
+            int ln = strlen(new_sentence);
+            if (ln < MAX_SENTENCE_LENGTH - 1) {
+                new_sentence[ln] = delim;
+                new_sentence[ln+1] = '\0';
+            }
         }
         
         // Rebuild full content - replace the modified sentence
@@ -477,17 +504,31 @@ void handle_write_end(int sock, const char* filename) {
         return;
     }
     
-    // Release the last lock (in real implementation, you'd track which lock belongs to this connection)
-    if (files[idx].lock_count > 0) {
+    // Release the lock belonging to this session (match by socket fd)
+    int found = -1;
+    for (int i = 0; i < files[idx].lock_count; i++) {
+        if (files[idx].sentence_locks[i].session_fd == sock) {
+            found = i;
+            break;
+        }
+    }
+    if (found >= 0) {
+        // remove this lock by shifting the array
+        for (int i = found; i < files[idx].lock_count - 1; i++) {
+            files[idx].sentence_locks[i] = files[idx].sentence_locks[i+1];
+        }
         files[idx].lock_count--;
+    } else {
+        sprintf(buffer, "ERROR No active write lock for this connection");
+        send(sock, buffer, strlen(buffer), 0);
+        pthread_mutex_unlock(&file_mutex);
+        return;
     }
     
     // Save to disk
     save_file_to_disk(filename, files[idx].content);
-    
-    // Update backup to current content for next UNDO (captures state before the NEXT write)
-    strcpy(files[idx].backup_content, files[idx].content);
-    files[idx].has_backup = 1;
+    // NOTE: backup_content was captured at WRITE_START (before edits).
+    // Do NOT overwrite the backup here, otherwise UNDO would revert to the same content.
     
     pthread_mutex_unlock(&file_mutex);
     
@@ -817,44 +858,22 @@ void* client_handler(void* arg) {
 }
 
 void scan_files() {
-#ifdef _WIN32
-    WIN32_FIND_DATA findData;
-    HANDLE hFind;
-    char search_path[MAX_PATH + 4];
-    snprintf(search_path, sizeof(search_path), "%s\\*", root_path);
-    
-    hFind = FindFirstFile(search_path, &findData);
-    if (hFind == INVALID_HANDLE_VALUE) return;
-    
-    do {
-        if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-            if (file_count >= MAX_FILES) break;
-            strcpy(files[file_count].filename, findData.cFileName);
-            files[file_count].lock_count = 0;
-            files[file_count].has_backup = 0;
-            load_file_from_disk(findData.cFileName, files[file_count].content);
-            file_count++;
-        }
-    } while (FindNextFile(hFind, &findData));
-    
-    FindClose(hFind);
-#else
     DIR* dir = opendir(root_path);
     if (!dir) return;
-    
+
     struct dirent* entry;
     while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_type == DT_REG) {
-            if (file_count >= MAX_FILES) break;
-            strcpy(files[file_count].filename, entry->d_name);
-            files[file_count].lock_count = 0;
-            files[file_count].has_backup = 0;
-            load_file_from_disk(entry->d_name, files[file_count].content);
-            file_count++;
-        }
+        // Skip directories and special entries
+        if (entry->d_type == DT_DIR) continue;
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        if (file_count >= MAX_FILES) break;
+        strcpy(files[file_count].filename, entry->d_name);
+        files[file_count].lock_count = 0;
+        files[file_count].has_backup = 0;
+        load_file_from_disk(entry->d_name, files[file_count].content);
+        file_count++;
     }
     closedir(dir);
-#endif
 }
 
 int main(int argc, char* argv[]) {
@@ -863,13 +882,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-#ifdef _WIN32
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        printf("WSAStartup failed\n");
-        return 1;
-    }
-#endif
+    // POSIX: no WSAStartup needed
     
     char* nm_ip = argv[1];
     int nm_port = atoi(argv[2]);
@@ -896,8 +909,16 @@ int main(int argc, char* argv[]) {
     }
     
     char buffer[MAX_BUFFER];
-    sprintf(buffer, "REGISTER_SS 127.0.0.1 %d %d %s %d", 
-            nm_comm_port, client_port, root_path, file_count);
+    // Determine local IP used for the connection to the Naming Server so we can register
+    char local_ip[32] = "127.0.0.1";
+    struct sockaddr_in local_addr;
+    socklen_t local_len = sizeof(local_addr);
+    if (getsockname(nm_sock, (struct sockaddr*)&local_addr, &local_len) == 0) {
+        inet_ntop(AF_INET, &local_addr.sin_addr, local_ip, sizeof(local_ip));
+    }
+
+    snprintf(buffer, sizeof(buffer), "REGISTER_SS %s %d %d %s %d", 
+            local_ip, nm_comm_port, client_port, root_path, file_count);
     send(nm_sock, buffer, strlen(buffer), 0);
     
     // Small delay to ensure naming server processed the registration message

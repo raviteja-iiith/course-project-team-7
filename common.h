@@ -7,36 +7,16 @@
 #include <time.h>
 #include <errno.h>
 
-#ifdef _WIN32
-    #include <winsock2.h>
-    #include <ws2tcpip.h>
-    #include <windows.h>
-    #include <direct.h>
-    #include <io.h>
-    #include <process.h>
-    #pragma comment(lib, "ws2_32.lib")
-    #define close closesocket
-    #define mkdir(dir, mode) _mkdir(dir)
-    #define usleep(x) Sleep((x)/1000)
-    typedef int socklen_t;
-    typedef HANDLE pthread_t;
-    typedef CRITICAL_SECTION pthread_mutex_t;
-    #define PTHREAD_MUTEX_INITIALIZER {0}
-    #define pthread_mutex_lock EnterCriticalSection
-    #define pthread_mutex_unlock LeaveCriticalSection
-    #define pthread_create(thread, attr, func, arg) ((*thread = (HANDLE)_beginthreadex(NULL, 0, (unsigned (__stdcall *)(void *))func, arg, 0, NULL)) ? 0 : -1)
-    #define pthread_detach(thread) CloseHandle(thread)
-#else
-    #include <unistd.h>
-    #include <arpa/inet.h>
-    #include <pthread.h>
-    #include <sys/stat.h>
-    #include <dirent.h>
-    #include <fcntl.h>
-    #include <sys/types.h>
-    #include <sys/socket.h>
-    #include <netinet/in.h>
-#endif
+// POSIX / Linux includes (Windows compatibility removed)
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 
 #define MAX_BUFFER 8192
 #define MAX_PATH 512

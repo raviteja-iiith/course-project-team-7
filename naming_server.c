@@ -982,6 +982,54 @@ void handle_exec_file(int client_sock, const char* filename, const char* usernam
     }
 }
 
+// Refresh metadata for a file by fetching its current content from the Storage Server
+void refresh_file_metadata(const char* filename) {
+    pthread_mutex_lock(&file_mutex);
+    int file_idx = find_file_index(filename);
+    if (file_idx < 0) {
+        pthread_mutex_unlock(&file_mutex);
+        return;
+    }
+    int ss_idx = files[file_idx].ss_index;
+
+    // Check storage server availability
+    pthread_mutex_lock(&ss_mutex);
+    if (ss_idx >= ss_count || !storage_servers[ss_idx].active) {
+        pthread_mutex_unlock(&ss_mutex);
+        pthread_mutex_unlock(&file_mutex);
+        return;
+    }
+    pthread_mutex_unlock(&ss_mutex);
+
+    // Connect to SS and request file content
+    int ss_sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in ss_addr;
+    ss_addr.sin_family = AF_INET;
+    ss_addr.sin_port = htons(storage_servers[ss_idx].nm_port);
+    inet_pton(AF_INET, storage_servers[ss_idx].ip, &ss_addr.sin_addr);
+
+    if (connect(ss_sock, (struct sockaddr*)&ss_addr, sizeof(ss_addr)) == 0) {
+        char buffer[MAX_BUFFER];
+        snprintf(buffer, sizeof(buffer), "GETFILE %s", filename);
+        send(ss_sock, buffer, strlen(buffer), 0);
+        char content[MAX_BUFFER] = {0};
+        int bytes = recv(ss_sock, content, MAX_BUFFER - 1, 0);
+        if (bytes > 0) {
+            content[bytes] = '\0';
+            update_file_metadata(file_idx, content);
+        }
+        close(ss_sock);
+    } else {
+        // mark storage server inactive
+        pthread_mutex_lock(&ss_mutex);
+        storage_servers[ss_idx].active = 0;
+        pthread_mutex_unlock(&ss_mutex);
+        close(ss_sock);
+    }
+
+    pthread_mutex_unlock(&file_mutex);
+}
+
 void* client_handler(void* arg) {
     int client_sock = *(int*)arg;
     free(arg);
@@ -1035,6 +1083,12 @@ void* client_handler(void* arg) {
         sscanf(buffer, "%s %s %s %s %s", command, username, access_type, param1, param2);
         int acc_type = (strcmp(access_type, "-W") == 0) ? 2 : 1;
         handle_add_access(client_sock, param1, username, param2, acc_type);
+    } else if (strcmp(command, "WRITE_DONE") == 0) {
+        // Client notifies NM that a write completed; refresh metadata
+        sscanf(buffer, "%s %s %s", command, username, param1);
+        refresh_file_metadata(param1);
+        sprintf(buffer, "ACK Metadata refreshed");
+        send(client_sock, buffer, strlen(buffer), 0);
     } else if (strcmp(command, "REMACCESS") == 0) {
         sscanf(buffer, "%s %s %s %s", command, username, param1, param2);
         handle_rem_access(client_sock, param1, username, param2);
@@ -1068,13 +1122,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-#ifdef _WIN32
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        printf("WSAStartup failed\n");
-        return 1;
-    }
-#endif
+    // POSIX: no WSAStartup needed
     
     int port = atoi(argv[1]);
     int server_sock = socket(AF_INET, SOCK_STREAM, 0);
